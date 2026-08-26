@@ -663,32 +663,80 @@ class Threshold:
         return finding.effective_rank >= self.rank
 
 
-def read_yaml_threshold(path: str, section: str) -> str:
-    """Read break_build_severity_threshold from one veracode.yml section.
+_TRUE = {"true", "yes", "on", "1", "enable", "enabled"}
+_FALSE = {"false", "no", "off", "0", "disable", "disabled"}
+
+
+def read_yaml_scalar(text: str, section: Optional[str], key: str) -> str:
+    """Read one scalar key from a veracode.yml, optionally inside a section.
 
     A deliberately narrow reader rather than a YAML parse: it needs no
-    dependency, and it only ever returns a scalar that is validated by
-    Threshold before use. Returns "" when the key or section is absent.
+    dependency, and it only ever returns a scalar the caller validates. Pass
+    section=None for a top-level key. Returns "" when absent.
     """
+    if not (text and key):
+        return ""
+    in_section = section is None
+    pattern = re.compile(r"^\s*" + re.escape(key) + r"\s*:\s*(.+?)\s*$")
+    for line in text.splitlines():
+        if section is not None:
+            if re.match(r"^" + re.escape(section) + r"\s*:\s*$", line):
+                in_section = True
+                continue
+            if re.match(r"^[^\s#]", line):
+                in_section = False
+        elif re.match(r"^\s", line):
+            continue  # a nested key cannot be the top-level one
+        if not in_section:
+            continue
+        m = pattern.match(line)
+        if m:
+            return re.sub(r"\s+#.*$", "", m.group(1)).strip().strip("\"'")
+    return ""
+
+
+def read_bool(value: str) -> Optional[bool]:
+    """Parse a YAML-ish boolean. None when the value is absent or unusable."""
+    key = (value or "").strip().lower()
+    if key in _TRUE:
+        return True
+    if key in _FALSE:
+        return False
+    return None
+
+
+def read_yaml_threshold(path: str, section: str) -> str:
+    """break_build_severity_threshold from one veracode.yml section."""
     if not (path and section and os.path.exists(path)):
         return ""
-    in_section = False
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                if re.match(r"^" + re.escape(section) + r"\s*:\s*$", line):
-                    in_section = True
-                    continue
-                if re.match(r"^[^\s#]", line):
-                    in_section = False
-                if not in_section:
-                    continue
-                m = re.match(
-                    r"^\s*break_build_severity_threshold\s*:\s*(.+?)\s*$", line)
-                if m:
-                    value = re.sub(r"\s+#.*$", "", m.group(1)).strip()
-                    return value.strip("\"'")
+            text = fh.read()
     except OSError:
+        return ""
+    return read_yaml_scalar(text, section, "break_build_severity_threshold")
+
+
+def fetch_repo_file(repo: str, path: str, ref: str, token: str) -> str:
+    """Contents of one file in another repository, or "".
+
+    The scanned repository's veracode.yml is not on this runner, and the
+    dispatch payload only carries the keys the Veracode app chooses to forward,
+    so a custom key cannot be relied on to arrive. Reading the file directly is
+    the only way a per-repository setting is guaranteed to be seen.
+    """
+    if not (repo and path and token):
+        return ""
+    api = os.environ.get("GITHUB_API_URL", "https://api.github.com")
+    url = f"{api.rstrip('/')}/repos/{repo}/contents/{path}"
+    if ref:
+        url += f"?ref={ref}"
+    try:
+        import base64
+        _status, data = gh_request(api, "GET", url, token)
+        if isinstance(data, dict) and data.get("content"):
+            return base64.b64decode(data["content"]).decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001 - absent config is the normal case
         return ""
     return ""
 

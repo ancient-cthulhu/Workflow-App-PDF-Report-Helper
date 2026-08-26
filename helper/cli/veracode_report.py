@@ -1482,6 +1482,78 @@ def comment_only(args: argparse.Namespace) -> int:
     return 0
 
 
+def scan_enabled(scan: str, local_config: str) -> Tuple[bool, str]:
+    """Whether the report should run for `scan`. Returns (enabled, reason).
+
+    Resolution, most specific first:
+
+      1. PDF_REPORT, from client_payload.user_config.pdf_report
+      2. scanned repo veracode.yml, this scan's section
+      3. scanned repo veracode.yml, top level
+      4. integration repo veracode.yml, this scan's section
+      5. integration repo veracode.yml, top level
+      6. on
+
+    The first is how the rest of the integration reads this file: the Veracode
+    app parses the scanned repository's veracode.yml, flattens the section for
+    the scan being dispatched, and delivers it as user_config. Using it keeps
+    the toggle consistent with every other setting and costs no API call.
+
+    Whether the app forwards keys it does not itself recognise is its own
+    business and not visible from here, so steps 2 and 3 read the file directly
+    as a fallback. If the key does arrive in user_config the fallback never
+    runs.
+
+    Absent config means on, because a helper that quietly stops reporting is
+    worse than one that reports when it was not wanted.
+    """
+    section = CONFIG_SECTION[scan]
+    key = "pdf_report"
+
+    from_payload = vf.read_bool(env("PDF_REPORT"))
+    if from_payload is not None:
+        return from_payload, (f"user_config.{key} is "
+                              f"{str(from_payload).lower()} for this scan")
+
+    remote = vf.fetch_repo_file(
+        env("SCAN_REPO"), env("CONFIG_FILE", "veracode.yml"),
+        env("BLOB_REF") or env("HEAD_SHA"),
+        env("GH_TOKEN") or env("GITHUB_TOKEN"))
+    local = ""
+    if local_config and os.path.exists(local_config):
+        try:
+            with open(local_config, "r", encoding="utf-8",
+                      errors="replace") as fh:
+                local = fh.read()
+        except OSError:
+            local = ""
+
+    for text, scope in ((remote, f"{env('SCAN_REPO')} veracode.yml"),
+                        (local, "the integration repo's veracode.yml")):
+        if not text:
+            continue
+        for sect, where in ((section, f"{section}.{key}"), (None, key)):
+            value = vf.read_yaml_scalar(text, sect, key)
+            decided = vf.read_bool(value)
+            if decided is not None:
+                return decided, f"{where} is {str(decided).lower()} in {scope}"
+    return True, "no pdf_report setting found, defaulting to on"
+
+
+def cmd_enabled(args: argparse.Namespace) -> int:
+    enabled, reason = scan_enabled(args.scan, args.config)
+    print(f"{SCAN_SHORT[args.scan]} PDF report: "
+          f"{'enabled' if enabled else 'disabled'} ({reason}).")
+    out = os.environ.get("GITHUB_OUTPUT")
+    if out:
+        try:
+            with open(out, "a", encoding="utf-8") as fh:
+                fh.write(f"enabled={str(enabled).lower()}\n")
+        except OSError as exc:
+            print(f"::warning::Could not write the step output: {exc}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         description="Build a consolidated Veracode PDF report from SAST, SCA "
@@ -1532,6 +1604,12 @@ def build_parser() -> argparse.ArgumentParser:
     cm.add_argument("--artifact-name", default="veracode-report")
     cm.add_argument("--pdf-url", default=None,
                     help="Link to use instead of resolving the artifact")
+
+    en = sub.add_parser("enabled", help="Decide whether the report should run "
+                                        "for this scan.")
+    en.add_argument("--scan", required=True, choices=SCAN_IDS)
+    en.add_argument("--config", default="veracode.yml",
+                    help="The integration repo's veracode.yml")
     return ap
 
 
@@ -1541,6 +1619,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return export_fragment(args)
     if args.command == "comment":
         return comment_only(args)
+    if args.command == "enabled":
+        return cmd_enabled(args)
     return build_report(args)
 
 
