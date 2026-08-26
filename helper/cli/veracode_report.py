@@ -1116,12 +1116,23 @@ def carry_prior_scans(ctx: "ReportContext") -> List[str]:
         return []
     match = STATE_RE.search(body)
     if not match:
+        print("::warning::The existing report comment carries no state block, "
+              "so earlier scans cannot be carried forward. It was probably "
+              "written by an older version of this helper; it will self-heal "
+              "on the next scan.")
         return []
     try:
         prior = json.loads(match.group(1))
-    except ValueError:
+    except ValueError as exc:
+        print(f"::warning::The existing comment's state block is unreadable "
+              f"({exc}); not carrying earlier scans forward.")
         return []
-    if not isinstance(prior, dict) or prior.get("sha") != ctx.sha:
+    if not isinstance(prior, dict):
+        return []
+    if prior.get("sha") != ctx.sha:
+        print(f"Existing comment is for commit "
+              f"{short_sha(prior.get('sha')) or 'unknown'}, not "
+              f"{short_sha(ctx.sha)}; starting fresh for this commit.")
         return []
     carried = []
     for scan, summary in (prior.get("scans") or {}).items():
@@ -1144,6 +1155,8 @@ def carry_prior_scans(ctx: "ReportContext") -> List[str]:
     if carried:
         print(f"Carried forward {', '.join(SCAN_SHORT[s] for s in carried)} "
               f"from the existing comment for this commit.")
+    else:
+        print("Existing comment had no other scans to carry forward.")
     return carried
 
 
@@ -1273,6 +1286,8 @@ def build_report(args: argparse.Namespace) -> int:
     if not fragments:
         print("::warning::No scan fragments found; no report produced.")
         return 0
+    print(f"Fragments available to this run: "
+          f"{', '.join(SCAN_SHORT[s] for s in SCAN_IDS if s in fragments)}")
 
     ctx = ReportContext(fragments)
     carry_prior_scans(ctx)

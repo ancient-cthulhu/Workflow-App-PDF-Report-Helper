@@ -870,6 +870,30 @@ def comment_marker(marker_id: str) -> str:
     return f"<!-- veracode-report:{marker_id} -->"
 
 
+_PR_CACHE: Dict[str, Optional[str]] = {}
+
+
+def effective_pr_number(api: str, repo: str, token: str) -> Optional[str]:
+    """PR_NUMBER, or the pull request resolved from the commit.
+
+    Shared by reading and writing the sticky comment. They used to differ:
+    writing fell back to resolving the PR from the commit while reading did
+    not, so on any dispatch that omits pr_number every scan could post a
+    comment but none could read the previous one back. Each scan then rewrote
+    the comment with only its own results.
+    """
+    pr = (os.environ.get("PR_NUMBER") or "").strip()
+    if pr.isdigit():
+        return pr
+    sha = os.environ.get("HEAD_SHA")
+    if not sha:
+        return None
+    key = f"{repo}@{sha}"
+    if key not in _PR_CACHE:
+        _PR_CACHE[key] = _resolve_pr_number(api, repo, sha, token)
+    return _PR_CACHE[key]
+
+
 def fetch_pr_comment(marker_id: str) -> Optional[str]:
     """Body of the existing sticky comment, or None.
 
@@ -878,16 +902,29 @@ def fetch_pr_comment(marker_id: str) -> Optional[str]:
     """
     token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
     repo = os.environ.get("SCAN_REPO")
-    pr = os.environ.get("PR_NUMBER")
     api = os.environ.get("GITHUB_API_URL", "https://api.github.com")
-    if not (token and repo and pr and str(pr).strip().isdigit()):
+    if not (token and repo):
+        print("::warning::Cannot read the existing report comment "
+              "(GH_TOKEN/SCAN_REPO not set); earlier scans' results cannot be "
+              "carried forward.")
+        return None
+    pr = effective_pr_number(api, repo, token)
+    if not pr:
+        print("::warning::Cannot read the existing report comment: no "
+              "PR_NUMBER and no pull request resolved from the commit.")
         return None
     try:
         existing = _find_comment(api, repo, pr, token,
                                  comment_marker(marker_id))
-    except Exception:  # noqa: BLE001 - best-effort
+    except Exception as exc:  # noqa: BLE001 - best-effort
+        print(f"::warning::Could not read the existing report comment "
+              f"({exc}); earlier scans' results cannot be carried forward.")
         return None
-    return (existing or {}).get("body")
+    if existing is None:
+        print(f"No existing report comment on PR #{pr}; this is the first "
+              f"scan to report for this commit.")
+        return None
+    return existing.get("body")
 
 
 def upsert_pr_comment(marker_id: str, body_md: str) -> bool:
@@ -910,14 +947,12 @@ def upsert_pr_comment(marker_id: str, body_md: str) -> bool:
         print("::warning::PR comment skipped: GH_TOKEN/SCAN_REPO not set.")
         return False
     if not (pr and str(pr).strip().isdigit()):
-        sha = os.environ.get("HEAD_SHA")
-        resolved = _resolve_pr_number(api, repo, sha, token) if sha else None
-        if not resolved:
+        pr = effective_pr_number(api, repo, token)
+        if not pr:
             print("::warning::PR comment skipped: no PR_NUMBER and no pull "
                   "request could be resolved from the commit (this run may "
                   "not be a pull request).")
             return False
-        pr = resolved
         print(f"Resolved PR #{pr} from the commit SHA.")
 
     marker = comment_marker(marker_id)

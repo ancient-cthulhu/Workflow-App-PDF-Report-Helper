@@ -4,7 +4,8 @@ Posts one pull-request comment with a PDF report built from your Veracode SAST,
 SCA and IaC/Secrets findings: an executive summary, then every finding with its
 severity, exact location, identifier and remediation detail.
 
-Standard library only, no dependencies. It reads scan output and comments.
+Standard library only, no dependencies. It reads scan output and comments. It
+never gates, never fails a build, and never changes an existing job's outcome.
 
 ## Install
 
@@ -100,7 +101,6 @@ after the `veracode-iac-secrets-scan` job:
       runs_on:   ${{ github.event.client_payload.user_config.default_runs_on }}
 ```
 
-
 That is the whole installation. No new secrets, no changes to any application
 repo, no changes to the existing scan jobs.
 
@@ -116,10 +116,29 @@ repo, no changes to the existing scan jobs.
   self-hosted included.
 - **`if: always()`** matters. The scan jobs fail the build on policy findings,
   and that is exactly when you want a report.
+- **`permissions:` goes on the calling job, not inside the report workflow.** A
+  called workflow may not request more than the caller holds, and the
+  integration's workflows inherit the repository default, so a `permissions:`
+  block inside the report workflow would fail validation with
+  `actions: none, pull-requests: none`. `actions: read` lets the three scans
+  find each other's findings and converge into one report; without it each scan
+  reports on its own and the others show as pending. Nothing needs
+  `pull-requests: write`, because the comment is posted with the dispatch
+  `token`.
+- **SAST is matrixed over packaged modules, and the globs matter.** A repo
+  with a .NET and a JS module produces two artifacts, `Veracode Pipeline-Scan
+  Results - veracode-auto-pack-app-dotnet.zip` and `... -js.zip`, each holding
+  its own `<job-index>-results.json`. The `*` in `results_artifact` downloads
+  and merges all of them, and `needs: [pipeline_scan]` waits for every leg, so
+  the report covers every module. Naming a single artifact would silently drop
+  the others.
 - **`results_path` is `[0-9]-results.json`**, one file per matrix leg. The
   filtered files are named `0-filtered_results.json`, with an underscore before
   `results`, so this pattern excludes them and you get the unfiltered findings.
-- **The `*.zip` suffix is deliberate.**
+- **The `*.zip` suffix is deliberate.** The scan also publishes `Veracode
+  Pipeline-Scan Results - 0-filtered_results.json - Mitigated findings`
+  artifacts. They do not end in `.zip`, so the pattern excludes them and
+  mitigated findings are not counted twice.
 - **Thresholds come from the `threshold` input, nothing else.** A stock
   Veracode integration has no severity threshold in `veracode.yml`, so there is
   nothing to read. See below if you want per-repo control.
@@ -158,13 +177,13 @@ so.
 | `include_outdated` | no | SCA text reports, adds Outdated Library issues |
 | `retention_days` | no | Artifact retention, default 30 |
 
-Permissions the workflow requests apply to the **scanning** repo: `contents:
-read` to check out the helper, `actions: read` to collect sibling fragments.
-Everything touching the scanned repo goes through `comment_token`, which needs
-Pull requests: write, Contents: read for source links, and Contents: write only
-if you set `publish_branch`.
+The report workflow requests no permissions of its own; it inherits the calling
+job. Grant that job `contents: read` to check out the helper and `actions: read`
+to collect sibling fragments. Everything touching the scanned repo goes through
+`token`, which needs Pull requests: write, Contents: read for source links, and
+Contents: write only if you set `publish_branch`.
 
-### Pipeline results
+### Pick the unfiltered pipeline results
 
 `1-results.json` is every finding. `1-filtered_results.json` is only what
 survived your policy's severity filter. A real run analysing 71 issues wrote 13
@@ -198,7 +217,7 @@ when the scan emits one. Bookmarks, page numbers, clickable links.
 **In the comment.** Severity counts, a per-scan table, the highest-severity
 findings, and a link to the PDF.
 
-**Scans that have not reported show as pending.** Same if a
+**Scans that have not reported show as pending, never as clean.** Same if a
 parser cannot trust its own output: if fewer SCA rows parse than the agent's
 own summary claims, that scan is marked pending rather than passing, so a
 format change upstream can never render a falsely clean report.
@@ -237,8 +256,3 @@ python3 helper/cli/veracode_report.py build \
 
 `SCAN_REPO`, `HEAD_SHA`, `BLOB_REF`, `PR_NUMBER` drive links and the comment;
 `GH_TOKEN` resolves paths and posts.
-
-
-## Support
-
-This is a community overlay for the Veracode GitHub Workflow Integration and is not officially supported by Veracode. When reporting an issue, include the failing job log (the resolved threshold line and the gate table) and the relevant `veracode.yml` section.
