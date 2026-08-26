@@ -866,6 +866,30 @@ def _resolve_pr_number(api: str, repo: str, sha: str,
     return None
 
 
+def comment_marker(marker_id: str) -> str:
+    return f"<!-- veracode-report:{marker_id} -->"
+
+
+def fetch_pr_comment(marker_id: str) -> Optional[str]:
+    """Body of the existing sticky comment, or None.
+
+    Lets a later scan recover what earlier scans already published, so the
+    comment can never regress to a weaker result than it previously showed.
+    """
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    repo = os.environ.get("SCAN_REPO")
+    pr = os.environ.get("PR_NUMBER")
+    api = os.environ.get("GITHUB_API_URL", "https://api.github.com")
+    if not (token and repo and pr and str(pr).strip().isdigit()):
+        return None
+    try:
+        existing = _find_comment(api, repo, pr, token,
+                                 comment_marker(marker_id))
+    except Exception:  # noqa: BLE001 - best-effort
+        return None
+    return (existing or {}).get("body")
+
+
 def upsert_pr_comment(marker_id: str, body_md: str) -> bool:
     """Create or update a sticky pull-request comment identified by a marker.
 
@@ -896,7 +920,7 @@ def upsert_pr_comment(marker_id: str, body_md: str) -> bool:
         pr = resolved
         print(f"Resolved PR #{pr} from the commit SHA.")
 
-    marker = f"<!-- veracode-report:{marker_id} -->"
+    marker = comment_marker(marker_id)
     body = f"{marker}\n{body_md}"
     for attempt in range(4):
         try:

@@ -403,9 +403,15 @@ class ReportContext:
 
     def totals(self) -> Dict[str, int]:
         counts = {b: 0 for b in BANDS}
-        for rec in self.all_findings:
-            counts[rec.get("band", "info")] += 1
+        for frag in self.fragments.values():
+            for band in BANDS:
+                counts[band] += int((frag.get("counts") or {}).get(band, 0))
         return counts
+
+    @property
+    def complete(self) -> bool:
+        """True only when every scan has reported for this commit."""
+        return not self.missing
 
     @property
     def gated_total(self) -> int:
@@ -481,17 +487,28 @@ def _stat_boxes(doc: pdf.Doc, counts: Dict[str, int]) -> None:
 
 def _verdict_banner(doc: pdf.Doc, ctx: ReportContext) -> None:
     failed = ctx.gated_total > 0
-    color = SEV_COLOR["critical"] if failed else PASS_GREEN
-    tint = SEV_TINT["critical"] if failed else PASS_TINT
-    headline = ("REVIEW RECOMMENDED" if failed
-                else "NOTHING AT OR ABOVE THRESHOLD")
+    partial = not ctx.complete
     if failed:
+        color, tint = SEV_COLOR["critical"], SEV_TINT["critical"]
+        headline = "REVIEW RECOMMENDED"
         detail = (f"{ctx.gated_total} of {ctx.finding_total} finding(s) meet or "
                   f"exceed the configured severity threshold. They are listed "
                   f"in priority order below.")
+    elif partial:
+        # Never present incomplete coverage as an all-clear.
+        color, tint = SEV_COLOR["medium"], SEV_TINT["medium"]
+        headline = "INCOMPLETE COVERAGE"
+        reported = len(SCAN_IDS) - len(ctx.missing)
+        detail = (f"Only {reported} of {len(SCAN_IDS)} scans have reported for "
+                  f"this commit, and nothing they found meets the configured "
+                  f"threshold. This is not an all-clear: "
+                  f"{', '.join(SCAN_SHORT[s] for s in ctx.missing)} has not "
+                  f"reported.")
     else:
-        detail = (f"{ctx.finding_total} finding(s) were reported, none of which "
-                  f"meet the configured severity threshold.")
+        color, tint = PASS_GREEN, PASS_TINT
+        headline = "NOTHING AT OR ABOVE THRESHOLD"
+        detail = (f"All three scans reported. {ctx.finding_total} finding(s) "
+                  f"in total, none of which meet the configured threshold.")
     lines = pdf.wrap_text(detail, "r", 8.6, doc.content_width - 34)
     h = 26 + len(lines) * 12 + 8
     doc.ensure(h + 8)
@@ -554,10 +571,13 @@ def _coverage_table(doc: pdf.Doc, ctx: ReportContext) -> None:
             continue
         gated = int(frag.get("gated") or 0)
         counts = frag.get("counts") or {}
+        status = f"{gated} to review" if gated else "Clear"
+        if frag.get("summary_only"):
+            status += " *"
         rows.append([
             {"text": SCAN_LABEL[scan], "color": LINK,
              "dest": SCAN_DEST[scan]},
-            {"text": f"{gated} to review" if gated else "Clear", "font": "b",
+            {"text": status, "font": "b",
              "color": SEV_COLOR["critical"] if gated else PASS_GREEN},
             str(frag.get("threshold", "-")),
             str(frag.get("total", 0)),
@@ -809,6 +829,14 @@ def _scan_section(doc: pdf.Doc, ctx: ReportContext, scan: str,
                    frag["report_url"])
         doc.y += 16
 
+    if frag.get("summary_only"):
+        doc.paragraph(
+            "These totals were reported by this scan's own run and carried "
+            "forward. The individual findings are not available in this "
+            "document; open that scan's report for the detail.",
+            font="i", color=MUTED)
+        return
+
     records = sorted(frag["findings"], key=_sort_key)
     if not records:
         doc.paragraph("No findings were reported by this scan.", font="i",
@@ -1053,13 +1081,85 @@ def publish_to_branch(path: str, branch: str, repo: str, token: str,
     return f"{server.rstrip('/')}/{repo}/blob/{branch}/{target}"
 
 
+STATE_RE = re.compile(r"<!--\s*veracode-report-state:\s*(\{.*?\})\s*-->",
+                      re.DOTALL)
+
+
+def encode_state(ctx: "ReportContext") -> str:
+    """Per-scan summary embedded in the comment, keyed to the commit."""
+    scans = {}
+    for scan, frag in ctx.fragments.items():
+        scans[scan] = {"counts": frag.get("counts") or {},
+                       "total": int(frag.get("total") or 0),
+                       "gated": int(frag.get("gated") or 0),
+                       "threshold": str(frag.get("threshold", "")),
+                       "run_url": str(frag.get("run_url", ""))}
+    payload = {"sha": ctx.sha, "scans": scans}
+    return ("<!-- veracode-report-state: "
+            + json.dumps(payload, separators=(",", ":")) + " -->")
+
+
+def carry_prior_scans(ctx: "ReportContext") -> List[str]:
+    """Re-attach scans an earlier run published that this run cannot see.
+
+    Sibling findings normally arrive through the Actions artifacts API, but
+    that needs actions: read and the artifacts must still exist. When it fails,
+    the scan that finishes last would otherwise rewrite the comment using only
+    its own results, turning a report that correctly showed findings into one
+    that says nothing was found. Reading the previous comment back makes the
+    summary additive, so it can never regress.
+
+    Only state recorded against the same commit is reused.
+    """
+    body = vf.fetch_pr_comment("report")
+    if not body:
+        return []
+    match = STATE_RE.search(body)
+    if not match:
+        return []
+    try:
+        prior = json.loads(match.group(1))
+    except ValueError:
+        return []
+    if not isinstance(prior, dict) or prior.get("sha") != ctx.sha:
+        return []
+    carried = []
+    for scan, summary in (prior.get("scans") or {}).items():
+        if scan not in SCAN_IDS or scan in ctx.fragments:
+            continue
+        if not isinstance(summary, dict):
+            continue
+        ctx.fragments[scan] = {
+            "scan": scan, "scan_label": SCAN_LABEL[scan],
+            "counts": {b: int((summary.get("counts") or {}).get(b, 0))
+                       for b in BANDS},
+            "total": int(summary.get("total") or 0),
+            "gated": int(summary.get("gated") or 0),
+            "threshold": summary.get("threshold", "?"),
+            "run_url": summary.get("run_url", ""),
+            "findings": [], "advisories": [], "summary_only": True,
+        }
+        carried.append(scan)
+    ctx.missing = [s for s in SCAN_IDS if s not in ctx.fragments]
+    if carried:
+        print(f"Carried forward {', '.join(SCAN_SHORT[s] for s in carried)} "
+              f"from the existing comment for this commit.")
+    return carried
+
+
 def build_comment(ctx: ReportContext, pdf_url: str, pdf_name: str,
                   branch_hosted: bool) -> str:
     artifact_repo = env("ARTIFACT_REPO")
     offsite = bool(artifact_repo and ctx.repo and artifact_repo != ctx.repo)
     failed = ctx.gated_total > 0
-    badge = (f"{ctx.gated_total} finding(s) at or above threshold" if failed
-             else "No findings at or above threshold")
+    if failed:
+        badge = f"{ctx.gated_total} finding(s) at or above threshold"
+    elif not ctx.complete:
+        badge = (f"Incomplete coverage: "
+                 f"{len(SCAN_IDS) - len(ctx.missing)} of {len(SCAN_IDS)} scans "
+                 f"reported, nothing above threshold so far")
+    else:
+        badge = "No findings at or above threshold"
     counts = ctx.totals()
     dot = {"critical": "\U0001f534", "high": "\U0001f7e0",
            "medium": "\U0001f7e1", "low": "\U0001f535", "info": "\u26aa"}
@@ -1147,6 +1247,7 @@ def build_comment(ctx: ReportContext, pdf_url: str, pdf_name: str,
         lines.append("")
     lines.append("<sub>Generated by the Veracode GitHub workflow "
                  "integration.</sub>")
+    lines.append(encode_state(ctx))
     return "\n".join(lines)
 
 
@@ -1174,6 +1275,7 @@ def build_report(args: argparse.Namespace) -> int:
         return 0
 
     ctx = ReportContext(fragments)
+    carry_prior_scans(ctx)
     try:
         render_pdf(ctx, args.out, args.page_size, args.max_detail)
     except Exception as exc:
@@ -1235,6 +1337,7 @@ def comment_only(args: argparse.Namespace) -> int:
         print("::warning::No scan fragments found; no comment posted.")
         return 0
     ctx = ReportContext(fragments)
+    carry_prior_scans(ctx)
     pdf_url = args.pdf_url or artifact_deep_link(
         ctx.server, env("ARTIFACT_REPO"), env("GITHUB_RUN_ID"),
         args.artifact_name, env("ARTIFACT_TOKEN") or env("GITHUB_TOKEN"),
