@@ -215,13 +215,16 @@ jobs:
                  "'$SCAN_REPO', normally client_payload.token."
           fi
 
-      - name: Confirm the helper is present
+      - name: Confirm the helper is present and self-consistent
         run: |
           set -euo pipefail
           for f in veracode_report.py veracode_findings.py veracode_pdf.py; do
             test -f "helper/cli/$f" || { echo "::error::helper/cli/$f is missing"; exit 1; }
           done
           python3 --version
+          # Reports a version mismatch between the three files, which is the
+          # usual result of copying an update in piecemeal.
+          python3 helper/cli/veracode_report.py --version
 
       # Downloading rather than passing a path keeps the two jobs independent.
       # Every artifact this run produced, unconditionally. No name, no
