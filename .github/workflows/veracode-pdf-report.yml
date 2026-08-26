@@ -1,6 +1,6 @@
 name: Veracode PDF Report
 
-# Called once per scan: exports that scan's findings, picks up any
+# Standalone. Called once per scan: exports that scan's findings, picks up any
 # sibling scan already finished for the same commit, rebuilds the combined PDF
 # and updates one sticky comment. Never fails a build. See the README to wire
 # it into your scan workflows.
@@ -105,16 +105,25 @@ on:
           publish_branch is set. Falls back to GITHUB_TOKEN when omitted.
         required: false
 
-permissions:
-  contents: read
-  actions: read          # read sibling scans' fragment artifacts for this commit
-  pull-requests: write   # post the report comment
+# No permissions block on purpose. A called workflow may not request more than
+# the calling job already holds, and the integration's workflows inherit the
+# repository default, which is usually contents: read only. Declaring
+# 'actions: read, pull-requests: write' here made every caller fail validation.
+#
+# Nothing here needs elevated GITHUB_TOKEN scopes anyway. The comment and the
+# source links use the dispatch token passed in as `token`. GITHUB_TOKEN is used
+# only to read sibling fragment artifacts from this repo, so grant the calling
+# job `actions: read` if you want the three scans to converge into one report.
+# Without it each scan still reports on its own.
 
 jobs:
   report:
     name: Build PDF report (${{ inputs.scan }})
     runs-on: ${{ fromJson(inputs.runs_on) }}
-    # Serialize the report jobs for a commit.
+    # Serialize the report jobs for a commit. Three scans finishing at once
+    # would otherwise each read "no comment yet" and post their own, and the
+    # earlier ones would build from fewer fragments than the later ones.
+    # Queue rather than cancel: the last to run is the one with every scan.
     concurrency:
       group: veracode-pdf-report-${{ inputs.scan_repo }}-${{ inputs.head_sha }}
       cancel-in-progress: false
@@ -131,6 +140,7 @@ jobs:
 
       # The scans run centrally against a different repository, so the
       # workflow's own GITHUB_TOKEN cannot reach the repo being commented on.
+      # Catch that here rather than after a scan has already run.
       - name: Check the token can reach the scanned repo
         env:
           SCAN_REPO: ${{ inputs.scan_repo }}
@@ -178,7 +188,10 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           GH_TOKEN: ${{ inputs.token || secrets.comment_token || github.token }}
           # Every caller-supplied value is passed as an environment variable and
-          # never interpolated into the script body.
+          # never interpolated into the script body. GitHub expands ${{ }} into
+          # the script text before bash parses it, so an input containing $( )
+          # or a quote would otherwise execute as code in a job that holds a
+          # cross-repository token.
           IN_SCAN: ${{ inputs.scan }}
           IN_RESULTS_PATH: ${{ inputs.results_path }}
           IN_RESULTS_ARTIFACT: ${{ inputs.results_artifact }}
