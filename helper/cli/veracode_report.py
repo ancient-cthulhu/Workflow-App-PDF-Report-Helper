@@ -11,7 +11,7 @@ posts a comment; it does not gate or fail a build.
 The three scans finish at different times, so no single job sees all three:
 
   export   Normalizes one scan's results into a fragment JSON, uploaded as
-           artifact veracode-findings-<sha>-<scan>.
+           artifact veracode-findings-<short-sha>-<scan>.
   build    Collects every fragment published for the same commit, its own plus
            any sibling already finished, and renders the combined PDF.
   comment  Upserts the sticky comment. Separate from build so the PDF artifact
@@ -336,7 +336,7 @@ def collect_fragments(dest_dir: str, sha: str, repo: str, token: str,
     os.makedirs(dest_dir, exist_ok=True)
     found = 0
     for scan in SCAN_IDS:
-        name = f"veracode-findings-{sha}-{scan}"
+        name = f"veracode-findings-{short_sha(sha)}-{scan}"
         url = (f"{api.rstrip('/')}/repos/{repo}/actions/artifacts"
                f"?name={name}&per_page=100")
         try:
@@ -395,6 +395,15 @@ def load_fragments(directory: str) -> Dict[str, Dict[str, Any]]:
                 continue
             scan = frag.get("scan")
             if scan not in SCAN_IDS or not isinstance(frag.get("findings"), list):
+                continue
+            # Artifacts are keyed on a short SHA, so verify the commit the
+            # fragment was actually built from before trusting it. A prefix
+            # collision would otherwise mix findings across commits.
+            wanted = env("HEAD_SHA")
+            if wanted and frag.get("sha") and frag["sha"] != wanted:
+                print(f"::warning::Ignoring a {scan} fragment built from "
+                      f"commit {short_sha(frag['sha'])}, not "
+                      f"{short_sha(wanted)}.")
                 continue
             prev = out.get(scan)
             if prev is None or str(frag.get("generated_at", "")) >= str(
@@ -629,17 +638,43 @@ def _coverage_table(doc: pdf.Doc, ctx: ReportContext) -> None:
     pdf.draw_table(doc, cols, rows, header_fill=NAVY)
 
 
-def _top_risks(doc: pdf.Doc, ctx: ReportContext, limit: int = 8) -> None:
+def _top_risks(doc: pdf.Doc, ctx: ReportContext, limit: int = 9) -> None:
     """Priority list on the summary page, sized to whatever room is left.
 
+    Findings are taken from each scan in turn rather than by severity alone.
+    A dependency scan routinely returns an order of magnitude more critical
+    findings than a static scan of the same repo: one real run had 26 critical
+    SCA findings against 2 SAST and 1 IaC, so a straight severity sort filled
+    every row with SCA and hid the injection flaws entirely. Round-robin
+    guarantees each scan appears while the selection is still the worst of
+    each, and the chosen rows are then shown in severity order.
+
     Measured before the heading is drawn so the block is either shown whole on
-    the summary page or left out entirely. A heading followed by one orphaned
-    row on the next page reads worse than no block at all, and every finding
-    appears in full detail later regardless.
+    the summary page or left out entirely.
     """
-    ranked = sorted(ctx.all_findings, key=_sort_key)[:limit]
+    by_scan: Dict[str, List[Dict[str, Any]]] = {}
+    for rec in ctx.all_findings:
+        by_scan.setdefault(rec.get("scan", ""), []).append(rec)
+    for records in by_scan.values():
+        records.sort(key=_sort_key)
+
+    picked: List[Dict[str, Any]] = []
+    depth = 0
+    while len(picked) < limit:
+        added = False
+        for scan in SCAN_IDS:
+            records = by_scan.get(scan) or []
+            if depth < len(records) and len(picked) < limit:
+                picked.append(records[depth])
+                added = True
+        if not added:
+            break
+        depth += 1
+
+    ranked = sorted(picked, key=_sort_key)
     if not ranked:
         return
+
     cols = [pdf.Column("Severity", 1.5), pdf.Column("Scan", 1.35),
             pdf.Column("Identifier", 2.0), pdf.Column("Finding", 4.0),
             pdf.Column("Location", 2.6)]
@@ -664,13 +699,36 @@ def _top_risks(doc: pdf.Doc, ctx: ReportContext, limit: int = 8) -> None:
         return
     rows = rows[:fits]
 
+    scans_shown = len({r.get("scan") for r in ranked[:fits]})
     doc.heading("Where to start", size=11.5, top_gap=6, rule=False,
                 bottom_gap=2)
     doc.paragraph(
-        f"The {len(rows)} highest-severity findings across all three scans, in "
-        f"priority order. Full detail for every finding follows.",
-        size=8.4, color=MUTED, bottom_gap=8)
+        f"The most severe findings from each of the {scans_shown} reporting "
+        f"scan(s), so no scan is crowded out by another. Full detail for every "
+        f"finding follows.", size=8.4, color=MUTED, bottom_gap=8)
     pdf.draw_table(doc, cols, rows, header_fill=NAVY)
+
+
+def _balanced_top(ctx: "ReportContext", limit: int) -> List[Dict[str, Any]]:
+    """Worst findings, taken from each scan in turn so none is crowded out."""
+    by_scan: Dict[str, List[Dict[str, Any]]] = {}
+    for rec in ctx.all_findings:
+        by_scan.setdefault(rec.get("scan", ""), []).append(rec)
+    for records in by_scan.values():
+        records.sort(key=_sort_key)
+    picked: List[Dict[str, Any]] = []
+    depth = 0
+    while len(picked) < limit:
+        added = False
+        for scan in SCAN_IDS:
+            records = by_scan.get(scan) or []
+            if depth < len(records) and len(picked) < limit:
+                picked.append(records[depth])
+                added = True
+        if not added:
+            break
+        depth += 1
+    return sorted(picked, key=_sort_key)
 
 
 def _location_text(rec: Dict[str, Any]) -> str:
@@ -1100,7 +1158,7 @@ def publish_to_branch(path: str, branch: str, repo: str, token: str,
             return json.loads(resp.read().decode("utf-8") or "null")
 
     base = f"{api.rstrip('/')}/repos/{repo}"
-    target = f"reports/{short_sha(sha) or 'latest'}/veracode-security-report.pdf"
+    target = f"reports/veracode-report-{short_sha(sha) or 'latest'}.pdf"
     with open(path, "rb") as fh:
         content = base64.b64encode(fh.read()).decode("ascii")
 
@@ -1282,7 +1340,7 @@ def build_comment(ctx: ReportContext, pdf_url: str, pdf_name: str,
                   f"`{pdf_name}` artifact."]
     lines.append("")
 
-    ranked = sorted(ctx.all_findings, key=_sort_key)[:5]
+    ranked = _balanced_top(ctx, 6)
     if ranked:
         lines += ["<details>",
                   "<summary><b>Highest-severity findings</b></summary>", "",
@@ -1453,12 +1511,12 @@ def build_parser() -> argparse.ArgumentParser:
     bd.add_argument("--collect", action="store_true",
                     help="Also pull sibling scan fragments for this commit "
                          "from the Actions artifacts API")
-    bd.add_argument("--out", default="veracode-security-report.pdf")
+    bd.add_argument("--out", default="veracode-report.pdf")
     bd.add_argument("--page-size", default="a4", choices=["a4", "letter"])
     bd.add_argument("--max-detail", type=int, default=250,
                     help="Maximum full-detail finding cards before the "
                          "remainder is summarized in a table")
-    bd.add_argument("--artifact-name", default="veracode-security-report",
+    bd.add_argument("--artifact-name", default="veracode-report",
                     help="Name of the uploaded artifact, used for the link")
     bd.add_argument("--publish-branch", default=None,
                     help="Commit the PDF to this branch of the scanned repo "
@@ -1471,7 +1529,7 @@ def build_parser() -> argparse.ArgumentParser:
     cm = sub.add_parser("comment", help="Post the sticky PR comment, after the "
                                         "PDF artifact has been uploaded.")
     cm.add_argument("--fragments", default="veracode-report-fragments")
-    cm.add_argument("--artifact-name", default="veracode-security-report")
+    cm.add_argument("--artifact-name", default="veracode-report")
     cm.add_argument("--pdf-url", default=None,
                     help="Link to use instead of resolving the artifact")
     return ap
