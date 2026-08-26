@@ -20,10 +20,8 @@ on:
         type: string
       results_artifact:
         description: >-
-          Artifact name or glob holding the results. Downloaded and merged, so
-          a matrixed pipeline scan that publishes one artifact per packaged
-          module is reported in full rather than one module at a time.
-          e.g. 'Veracode Pipeline-Scan Results - *.zip'.
+          Deprecated and ignored. Every artifact in the run is downloaded, so
+          no artifact name has to be guessed. Safe to leave set or remove.
         required: false
         type: string
         default: ''
@@ -169,65 +167,42 @@ jobs:
           python3 --version
 
       # Downloading rather than passing a path keeps the two jobs independent.
-      - name: Fetch the scan results
-        if: inputs.results_artifact != ''
+      # Every artifact this run produced, unconditionally. No name, no
+      # pattern, no extension assumptions.
+      #
+      # This used to download a caller-supplied artifact pattern. A Java repo
+      # publishes 'Veracode Pipeline-Scan Results - verademo.war' next to a
+      # '...-js-no-pm.zip', so a pattern ending in '.zip' fetched only the
+      # module with no findings and the report announced SAST as clean. Any
+      # scheme that has to guess an artifact name can fail that way, and it
+      # fails silently, which is the one outcome this tool must not have.
+      - name: Fetch this run's artifacts
         uses: actions/download-artifact@v7
         continue-on-error: true
         with:
-          pattern: ${{ inputs.results_artifact }}
-          merge-multiple: true
-          path: scan-results
+          path: scan-artifacts
 
       - name: Locate the results
         id: locate
         env:
           IN_RESULTS_PATH: ${{ inputs.results_path }}
           IN_SCAN: ${{ inputs.scan }}
+          HEAD_SHA: ${{ inputs.head_sha }}
         run: |
           set -euo pipefail
           case "$IN_RESULTS_PATH" in
             /*|*..*) echo "::error::results_path must be relative."; exit 1 ;;
             "")      echo "::error::results_path is required."; exit 1 ;;
           esac
-          # Search by filename, recursively, from the workspace. Whether
-          # merge-multiple flattened the artifacts changes the layout, so
-          # matching at a fixed depth is fragile.
           NAME="$(basename -- "$IN_RESULTS_PATH")"
+          echo "Artifacts downloaded:"
+          find scan-artifacts -maxdepth 1 -mindepth 1 -type d 2>/dev/null \
+            | sed 's#scan-artifacts/#  #' || echo "  (none)"
           COUNT="$(find . -type f -name "$NAME" -size +0c 2>/dev/null | wc -l)"
-          COMPLETE=true
-          [ "$COUNT" -eq 0 ] && COMPLETE=false
-
-          # A matrixed pipeline scan writes <index>-results.json and
-          # <index>-filtered_results.json per module, so the filtered files
-          # enumerate the modules that ran. Having some but not all of them is
-          # just as wrong as having none: it reports one module as the whole
-          # SAST result.
-          if [ "$IN_SCAN" = "pipeline" ] && [ "$COUNT" -gt 0 ]; then
-            LEGS="$(find . -type f -name '*-filtered_results.json' 2>/dev/null \
-                    | sed 's#.*/##; s#-filtered_results\.json$##' \
-                    | grep -E '^[0-9]+$' | sort -u || true)"
-            GOT="$(find . -type f -name "$NAME" -size +0c 2>/dev/null \
-                   | sed 's#.*/##; s#-results\.json$##' \
-                   | grep -E '^[0-9]+$' | sort -u || true)"
-            if [ -n "$LEGS" ] && [ -n "$(comm -23 <(echo "$LEGS") <(echo "$GOT"))" ]; then
-              COMPLETE=false
-              echo "Modules that ran: $(echo $LEGS). Results found for: $(echo $GOT)."
-            fi
-          fi
+          echo "Files named '$NAME': $COUNT"
+          find . -type f -name "$NAME" -size +0c 2>/dev/null | sed 's/^/  /'
           echo "found=$COUNT" >> "$GITHUB_OUTPUT"
-          echo "complete=$COMPLETE" >> "$GITHUB_OUTPUT"
-          echo "Matched $COUNT file(s) named '$NAME'. Coverage complete: $COMPLETE."
-
-      # If the artifact pattern matched nothing, or matched only some of the
-      # modules that ran, pull every artifact this run produced and look again.
-      # A wrong or outdated results_artifact then costs bandwidth instead of
-      # silently producing a report that covers part of the scan.
-      - name: Fetch every artifact from this run
-        if: steps.locate.outputs.complete != 'true'
-        uses: actions/download-artifact@v7
-        continue-on-error: true
-        with:
-          path: scan-results-all
+          echo "short_sha=$(printf '%.8s' "${HEAD_SHA:-unknown}")" >> "$GITHUB_OUTPUT"
 
       - name: Normalize this scan's findings
         id: export
@@ -307,7 +282,7 @@ jobs:
         if: steps.export.outputs.exported == 'true'
         uses: actions/upload-artifact@v7
         with:
-          name: veracode-findings-${{ inputs.head_sha }}-${{ inputs.scan }}
+          name: veracode-findings-${{ steps.locate.outputs.short_sha }}-${{ inputs.scan }}
           path: fragments/${{ inputs.scan }}.json
           retention-days: ${{ inputs.retention_days }}
           if-no-files-found: warn
@@ -325,6 +300,7 @@ jobs:
           ARTIFACT_TOKEN: ${{ github.token }}
           # The comment and source links target the scanned repo.
           GH_TOKEN: ${{ inputs.token || secrets.comment_token || github.token }}
+          SHORT_SHA: ${{ steps.locate.outputs.short_sha }}
           IN_PAGE_SIZE: ${{ inputs.page_size }}
           IN_PUBLISH_BRANCH: ${{ inputs.publish_branch }}
         run: |
@@ -335,13 +311,13 @@ jobs:
           esac
 
           ARGS=(--fragments fragments --collect
-                --out veracode-security-report.pdf
+                --out "veracode-report-$SHORT_SHA.pdf"
                 --page-size "$IN_PAGE_SIZE"
-                --artifact-name "veracode-security-report-$HEAD_SHA")
+                --artifact-name "veracode-report-$SHORT_SHA")
           [ -n "$IN_PUBLISH_BRANCH" ] && ARGS+=(--publish-branch "$IN_PUBLISH_BRANCH")
 
           python3 helper/cli/veracode_report.py build "${ARGS[@]}"
-          if [ -f veracode-security-report.pdf ]; then
+          if [ -f "veracode-report-$SHORT_SHA.pdf" ]; then
             echo "built=true" >> "$GITHUB_OUTPUT"
           else
             echo "built=false" >> "$GITHUB_OUTPUT"
@@ -351,8 +327,8 @@ jobs:
         if: steps.build.outputs.built == 'true'
         uses: actions/upload-artifact@v7
         with:
-          name: veracode-security-report-${{ inputs.head_sha }}
-          path: veracode-security-report.pdf
+          name: veracode-report-${{ steps.locate.outputs.short_sha }}
+          path: veracode-report-*.pdf
           retention-days: ${{ inputs.retention_days }}
           if-no-files-found: warn
           overwrite: true
@@ -367,8 +343,9 @@ jobs:
           ARTIFACT_REPO: ${{ github.repository }}
           ARTIFACT_TOKEN: ${{ github.token }}
           GH_TOKEN: ${{ inputs.token || secrets.comment_token || github.token }}
+          SHORT_SHA: ${{ steps.locate.outputs.short_sha }}
         run: |
           set -euo pipefail
           python3 helper/cli/veracode_report.py comment \
             --fragments fragments \
-            --artifact-name "veracode-security-report-$HEAD_SHA"
+            --artifact-name "veracode-report-$SHORT_SHA"
