@@ -38,6 +38,9 @@ existing `pipeline_scan` job:
   pdf_report_sast:
     needs: [pipeline_scan]
     if: always()
+    permissions:
+      contents: read
+      actions: read
     uses: ./.github/workflows/veracode-pdf-report.yml
     with:
       scan: pipeline
@@ -58,6 +61,9 @@ existing `pipeline_scan` job:
   pdf_report_sca:
     needs: [veracode-sca-scan]
     if: always()
+    permissions:
+      contents: read
+      actions: read
     uses: ./.github/workflows/veracode-pdf-report.yml
     with:
       scan: sca
@@ -78,6 +84,9 @@ after the `veracode-iac-secrets-scan` job:
   pdf_report_iac:
     needs: [veracode-iac-secrets-scan]
     if: always()
+    permissions:
+      contents: read
+      actions: read
     uses: ./.github/workflows/veracode-pdf-report.yml
     with:
       scan: iac
@@ -90,6 +99,7 @@ after the `veracode-iac-secrets-scan` job:
       token:     ${{ github.event.client_payload.token }}
       runs_on:   ${{ github.event.client_payload.user_config.default_runs_on }}
 ```
+
 
 That is the whole installation. No new secrets, no changes to any application
 repo, no changes to the existing scan jobs.
