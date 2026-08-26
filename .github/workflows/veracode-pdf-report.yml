@@ -178,6 +178,57 @@ jobs:
           merge-multiple: true
           path: scan-results
 
+      - name: Locate the results
+        id: locate
+        env:
+          IN_RESULTS_PATH: ${{ inputs.results_path }}
+          IN_SCAN: ${{ inputs.scan }}
+        run: |
+          set -euo pipefail
+          case "$IN_RESULTS_PATH" in
+            /*|*..*) echo "::error::results_path must be relative."; exit 1 ;;
+            "")      echo "::error::results_path is required."; exit 1 ;;
+          esac
+          # Search by filename, recursively, from the workspace. Whether
+          # merge-multiple flattened the artifacts changes the layout, so
+          # matching at a fixed depth is fragile.
+          NAME="$(basename -- "$IN_RESULTS_PATH")"
+          COUNT="$(find . -type f -name "$NAME" -size +0c 2>/dev/null | wc -l)"
+          COMPLETE=true
+          [ "$COUNT" -eq 0 ] && COMPLETE=false
+
+          # A matrixed pipeline scan writes <index>-results.json and
+          # <index>-filtered_results.json per module, so the filtered files
+          # enumerate the modules that ran. Having some but not all of them is
+          # just as wrong as having none: it reports one module as the whole
+          # SAST result.
+          if [ "$IN_SCAN" = "pipeline" ] && [ "$COUNT" -gt 0 ]; then
+            LEGS="$(find . -type f -name '*-filtered_results.json' 2>/dev/null \
+                    | sed 's#.*/##; s#-filtered_results\.json$##' \
+                    | grep -E '^[0-9]+$' | sort -u || true)"
+            GOT="$(find . -type f -name "$NAME" -size +0c 2>/dev/null \
+                   | sed 's#.*/##; s#-results\.json$##' \
+                   | grep -E '^[0-9]+$' | sort -u || true)"
+            if [ -n "$LEGS" ] && [ -n "$(comm -23 <(echo "$LEGS") <(echo "$GOT"))" ]; then
+              COMPLETE=false
+              echo "Modules that ran: $(echo $LEGS). Results found for: $(echo $GOT)."
+            fi
+          fi
+          echo "found=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "complete=$COMPLETE" >> "$GITHUB_OUTPUT"
+          echo "Matched $COUNT file(s) named '$NAME'. Coverage complete: $COMPLETE."
+
+      # If the artifact pattern matched nothing, or matched only some of the
+      # modules that ran, pull every artifact this run produced and look again.
+      # A wrong or outdated results_artifact then costs bandwidth instead of
+      # silently producing a report that covers part of the scan.
+      - name: Fetch every artifact from this run
+        if: steps.locate.outputs.complete != 'true'
+        uses: actions/download-artifact@v7
+        continue-on-error: true
+        with:
+          path: scan-results-all
+
       - name: Normalize this scan's findings
         id: export
         env:
@@ -187,57 +238,57 @@ jobs:
           PR_NUMBER: ${{ inputs.pr_number }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           GH_TOKEN: ${{ inputs.token || secrets.comment_token || github.token }}
-          # Every caller-supplied value is passed as an environment variable and
-          # never interpolated into the script body. GitHub expands ${{ }} into
-          # the script text before bash parses it, so an input containing $( )
-          # or a quote would otherwise execute as code in a job that holds a
-          # cross-repository token.
           IN_SCAN: ${{ inputs.scan }}
           IN_RESULTS_PATH: ${{ inputs.results_path }}
-          IN_RESULTS_ARTIFACT: ${{ inputs.results_artifact }}
           IN_THRESHOLD: ${{ inputs.threshold }}
           IN_INCLUDE_OUTDATED: ${{ inputs.include_outdated }}
         run: |
           set -euo pipefail
           mkdir -p fragments
-
           case "$IN_SCAN" in
             pipeline|sca|iac) ;;
             *) echo "::error::scan must be pipeline, sca or iac."; exit 1 ;;
           esac
 
-          # Confine the results pattern to the workspace. It is a glob, so it
-          # cannot be quoted at the point of expansion; restricting it here is
-          # what stops an absolute path or a traversal reading runner state
-          # into the report and its retained artifact.
-          case "$IN_RESULTS_PATH" in
-            /*|*..*) echo "::error::results_path must be relative to the workspace."; exit 1 ;;
-            "")      echo "::error::results_path is required."; exit 1 ;;
-          esac
-
-          # Collect every non-empty match, not just the newest. The pipeline
-          # scan is matrixed over packaged modules and writes one
-          # <job-index>-results.json per module, so taking a single file would
-          # silently drop the findings of every other module.
+          NAME="$(basename -- "$IN_RESULTS_PATH")"
           RESULTS=()
-          collect() {
-            local pattern="$1" match
-            for match in $(ls -1 -- $pattern 2>/dev/null || true); do
-              [ -f "$match" ] && [ -s "$match" ] && RESULTS+=("$match")
-            done
-          }
-
-          cd "$GITHUB_WORKSPACE"
-          collect "$IN_RESULTS_PATH"
-          [ ${#RESULTS[@]} -eq 0 ] && collect "scan-results/$IN_RESULTS_PATH"
-          [ ${#RESULTS[@]} -eq 0 ] && collect "scan-results/$(basename -- "$IN_RESULTS_PATH")"
+          while IFS= read -r f; do
+            [ -n "$f" ] && RESULTS+=("$f")
+          done < <(find . -type f -name "$NAME" -size +0c 2>/dev/null | sort)
 
           if [ ${#RESULTS[@]} -eq 0 ]; then
-            echo "::warning::No non-empty results file matched '$IN_RESULTS_PATH'."
+            echo "::warning::No non-empty file named '$NAME' anywhere in the workspace."
+            echo "Files that were available:"
+            find . -type f \( -name '*results*.json' -o -name '*.txt' \) \
+              2>/dev/null | head -40 | sed 's/^/  /'
             echo "exported=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          echo "Using ${#RESULTS[@]} results file(s): ${RESULTS[*]}"
+          echo "Using ${#RESULTS[@]} results file(s):"
+          printf '  %s\n' "${RESULTS[@]}"
+
+          # The pipeline scan is matrixed: each leg writes <index>-results.json
+          # and <index>-filtered_results.json. The filtered files therefore
+          # enumerate the legs that ran. If a leg's results file is missing, the
+          # scan is reported as not run rather than as clean, because reporting
+          # one module of several as the whole SAST result is how a repo with
+          # real findings ends up displayed as passing.
+          if [ "$IN_SCAN" = "pipeline" ]; then
+            LEGS="$(find . -type f -name '*-filtered_results.json' 2>/dev/null \
+                    | sed 's#.*/##; s#-filtered_results\.json$##' \
+                    | grep -E '^[0-9]+$' | sort -u || true)"
+            GOT="$(printf '%s\n' "${RESULTS[@]}" \
+                   | sed 's#.*/##; s#-results\.json$##' \
+                   | grep -E '^[0-9]+$' | sort -u || true)"
+            if [ -n "$LEGS" ]; then
+              MISSING="$(comm -23 <(echo "$LEGS") <(echo "$GOT") | tr '\n' ' ')"
+              if [ -n "${MISSING// /}" ]; then
+                echo "::warning::The pipeline scan ran $(echo "$LEGS" | wc -w) module(s) but results for module index(es) ${MISSING}are missing, so this report would cover only part of the scan. Marking SAST as not reported instead of clean. Widen results_artifact: a packaged module keeps its own extension, so '.war' and '.jar' modules are excluded by a pattern ending in '.zip'."
+                echo "exported=false" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+            fi
+          fi
 
           ARGS=(--mode "$IN_SCAN" --input "${RESULTS[@]}"
                 --threshold "$IN_THRESHOLD"
