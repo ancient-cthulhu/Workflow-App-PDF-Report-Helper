@@ -90,6 +90,22 @@ on:
         required: false
         type: string
         default: '"ubuntu-latest"'
+      pdf_report:
+        description: >-
+          Wire to client_payload.user_config.pdf_report. The Veracode app
+          flattens the scanned repo's veracode.yml section for this scan into
+          user_config, so this is the same route every other setting takes.
+          Empty means fall back to reading veracode.yml directly.
+        required: false
+        type: string
+        default: ''
+      config_file:
+        description: >-
+          Config file consulted for the pdf_report toggle, in both this repo
+          and the scanned repo.
+        required: false
+        type: string
+        default: 'veracode.yml'
       retention_days:
         description: 'How long to keep the report and fragment artifacts'
         required: false
@@ -115,7 +131,46 @@ on:
 # Without it each scan still reports on its own.
 
 jobs:
+  # Decides whether to report at all, before anything is downloaded. Its own
+  # job so a disabled scan skips visibly instead of running steps that do
+  # nothing.
+  gate:
+    name: Check the report is enabled (${{ inputs.scan }})
+    runs-on: ${{ fromJson(inputs.runs_on) }}
+    continue-on-error: true
+    timeout-minutes: 5
+    outputs:
+      enabled: ${{ steps.gate.outputs.enabled }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            helper/cli
+            ${{ inputs.config_file }}
+          sparse-checkout-cone-mode: false
+
+      - id: gate
+        env:
+          SCAN_REPO: ${{ inputs.scan_repo }}
+          BLOB_REF: ${{ inputs.blob_ref || inputs.head_sha }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          GH_TOKEN: ${{ inputs.token || secrets.comment_token || github.token }}
+          CONFIG_FILE: ${{ inputs.config_file }}
+          PDF_REPORT: ${{ inputs.pdf_report }}
+          IN_SCAN: ${{ inputs.scan }}
+          IN_CONFIG: ${{ inputs.config_file }}
+        run: |
+          set -euo pipefail
+          case "$IN_SCAN" in
+            pipeline|sca|iac) ;;
+            *) echo "::error::scan must be pipeline, sca or iac."; exit 1 ;;
+          esac
+          python3 helper/cli/veracode_report.py enabled \
+            --scan "$IN_SCAN" --config "$IN_CONFIG"
+
   report:
+    needs: [gate]
+    if: needs.gate.outputs.enabled != 'false'
     name: Build PDF report (${{ inputs.scan }})
     runs-on: ${{ fromJson(inputs.runs_on) }}
     # Serialize the report jobs for a commit. Three scans finishing at once
@@ -133,7 +188,9 @@ jobs:
       - name: Check out the helper
         uses: actions/checkout@v6
         with:
-          sparse-checkout: helper/cli
+          sparse-checkout: |
+            helper/cli
+            ${{ inputs.config_file }}
           sparse-checkout-cone-mode: false
 
       # The scans run centrally against a different repository, so the
