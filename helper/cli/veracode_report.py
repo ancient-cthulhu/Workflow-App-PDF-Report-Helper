@@ -36,6 +36,7 @@ import json
 import os
 import re
 import sys
+import urllib.request as _urllib_request
 import zipfile
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -171,6 +172,7 @@ def export_fragment(args: argparse.Namespace) -> int:
         return 0
 
     findings: List["vf.Finding"] = []
+    notes: List[str] = []
     report_url = ""
     advisories: List[Dict[str, str]] = []
     parsed_files = 0
@@ -185,7 +187,7 @@ def export_fragment(args: argparse.Namespace) -> int:
             print(f"::warning::Results file {path} is empty.")
             continue
         try:
-            batch = vf.load_findings(mode, raw, args.include_outdated)
+            batch = vf.load_findings(mode, raw, args.include_outdated, notes)
         except vf.FindingsError as exc:
             # One unreadable module must not quietly shrink the report, so the
             # whole scan is abandoned rather than reported as partial.
@@ -255,6 +257,7 @@ def export_fragment(args: argparse.Namespace) -> int:
         "total": len(records),
         "gated": sum(1 for r in records if r["gated"]),
         "advisories": advisories,
+        "notes": notes,
         "findings": records,
     }
 
@@ -277,6 +280,44 @@ def _api_get(url: str, token: str, accept: str = "application/vnd.github+json"):
         req.add_header("Authorization", f"Bearer {token}")
     with urllib.request.urlopen(req, timeout=45) as resp:
         return resp.read()
+
+
+class _NoRedirect(_urllib_request.HTTPRedirectHandler):
+    """Stop urllib following a redirect so the caller can re-issue it."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _download_artifact(url: str, token: str) -> bytes:
+    """Download an artifact zip, dropping the GitHub token at the redirect.
+
+    The artifact endpoint answers with a redirect to blob storage, which is
+    already authenticated by the signature in the redirect URL. urllib replays
+    every header on a redirect by default, and the blob service rejects a
+    request carrying someone else's Authorization header with a 401. Following
+    the redirect by hand, without the token, is both what the service expects
+    and the only way to avoid handing the token to a third-party host.
+    """
+    import urllib.error
+
+    req = _urllib_request.Request(url, method="GET")
+    req.add_header("Accept", "application/vnd.github+json")
+    req.add_header("X-GitHub-Api-Version", "2022-11-28")
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    opener = _urllib_request.build_opener(_NoRedirect)
+    try:
+        with opener.open(req, timeout=90) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as exc:
+        if exc.code not in (301, 302, 303, 307, 308):
+            raise
+        location = exc.headers.get("Location")
+        if not location:
+            raise
+        with _urllib_request.urlopen(location, timeout=90) as resp:
+            return resp.read()
 
 
 def collect_fragments(dest_dir: str, sha: str, repo: str, token: str,
@@ -310,7 +351,7 @@ def collect_fragments(dest_dir: str, sha: str, repo: str, token: str,
         artifacts.sort(key=lambda a: a.get("created_at") or "", reverse=True)
         newest = artifacts[0]
         try:
-            blob = _api_get(newest["archive_download_url"], token)
+            blob = _download_artifact(newest["archive_download_url"], token)
             with zipfile.ZipFile(io.BytesIO(blob)) as zf:
                 members = [m for m in zf.namelist() if m.endswith(".json")]
                 if not members:
@@ -821,6 +862,19 @@ def _scan_section(doc: pdf.Doc, ctx: ReportContext, scan: str,
                f"'{frag.get('threshold', '?')}'", "r", 8.6, BODY)
     doc.y += 22
 
+    for note in (frag.get("notes") or []):
+        doc.ensure(30)
+        lines = pdf.wrap_text(note, "r", 8.4, doc.content_width - 30)
+        h = len(lines) * 11.5 + 14
+        doc.c.rect(doc.ml, doc.y, doc.content_width, h,
+                   fill=SEV_TINT["medium"], radius=3)
+        doc.c.rect(doc.ml, doc.y, 3.0, h, fill=SEV_COLOR["medium"])
+        y = doc.y + 7
+        for line in lines:
+            doc.c.text(doc.ml + 14, y, line, "r", 8.4, BODY)
+            y += 11.5
+        doc.y += h + 10
+
     if frag.get("report_url"):
         doc.ensure(14)
         label = "Full results on the Veracode platform"
@@ -1251,6 +1305,12 @@ def build_comment(ctx: ReportContext, pdf_url: str, pdf_name: str,
                 f"{SCAN_SHORT.get(rec.get('scan', ''), '')} | {ident} | "
                 f"{vf.md_escape(rec.get('title'), 110)} | {loc} |")
         lines += ["", "</details>", ""]
+
+    for scan in SCAN_IDS:
+        for note in ((ctx.fragments.get(scan) or {}).get("notes") or []):
+            lines.append(f"> \u26a0\ufe0f **{SCAN_SHORT[scan]}:** "
+                         f"{vf.sanitize(note, 400)}")
+            lines.append("")
 
     if ctx.missing:
         names = ", ".join(SCAN_SHORT[s] for s in ctx.missing)

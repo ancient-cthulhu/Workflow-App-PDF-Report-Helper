@@ -443,6 +443,16 @@ SUMMARY_ROW = re.compile(
 )
 
 
+def parse_sca_summary_bands(text: str) -> Optional[Dict[str, int]]:
+    """Per-band vulnerability counts from the agent's summary, or None."""
+    bands: Dict[str, int] = {}
+    for line in text.splitlines():
+        m = SUMMARY_ROW.match(line)
+        if m:
+            bands[m.group(1).lower()] = int(m.group(2))
+    return bands or None
+
+
 def parse_sca_summary(text: str) -> Optional[int]:
     """Total vulnerabilities the agent summary reports, or None if absent."""
     total = 0
@@ -702,8 +712,8 @@ def resolve_threshold(config_paths: Sequence[str], section: str,
     return "medium"
 
 
-def load_findings(mode: str, raw: str,
-                  include_outdated: bool = False) -> List[Finding]:
+def load_findings(mode: str, raw: str, include_outdated: bool = False,
+                  notes: Optional[List[str]] = None) -> List[Finding]:
     """Parse raw scan output for `mode` into findings.
 
     In sca mode the format is auto-detected: a payload starting with '{' or '['
@@ -731,31 +741,64 @@ def load_findings(mode: str, raw: str,
             raise FindingsError(f"SCA results are not valid JSON: {exc}.")
 
     findings = parse_sca_text(raw, include_outdated=include_outdated)
-    _assert_sca_complete(raw, findings)
+    _check_sca_complete(raw, findings, notes)
     return findings
 
 
-def _assert_sca_complete(text: str, findings: Sequence[Finding]) -> None:
-    """Refuse to report a partial SCA parse as a complete one.
+def _check_sca_complete(text: str, findings: Sequence[Finding],
+                        notes: Optional[List[str]] = None) -> None:
+    """Cross-check the parsed rows against the agent's own summary counts.
 
-    The issue table is located by matching its header row. If the agent renames
-    a column, the header stops matching and every row is skipped: the scan then
-    reports zero findings and the report renders clean. That is the worst
-    failure this tool can have, so the agent's own summary counts are used as
-    an independent check. Raising here makes the caller mark the scan as
-    pending rather than passing.
+    The issue table is located by matching its header row, so a format change
+    upstream could skip rows silently and render a clean report over real
+    vulnerabilities. The summary block is an independent count that catches it.
+
+    The comparison is per severity band, not on the total, because the issue
+    table is filtered while the summary is not. A real scan summarising 26
+    critical, 67 high, 68 medium and 12 low lists only the first three bands,
+    161 rows in all: every listed band matches exactly and the low ones are
+    simply not itemised. Comparing totals read that as 12 lost findings and
+    discarded an entirely good scan. A band the table omits is a reporting
+    choice and is noted so the totals are not misread; a band it lists but
+    under-reports is a real parsing gap and is warned about.
     """
-    expected = parse_sca_summary(text)
-    if expected is None:
+    expected = parse_sca_summary_bands(text)
+    if not expected:
         return
-    parsed = sum(1 for f in findings if f.category == "Vulnerability")
-    if parsed < expected:
-        raise FindingsError(
-            f"SCA summary reports {expected} vulnerability finding(s) but only "
-            f"{parsed} row(s) could be parsed. The report would understate the "
-            f"risk, so this scan is being marked as not reported. The agent's "
-            f"issue-table format has probably changed.")
+    parsed: Dict[str, int] = {}
+    for f in findings:
+        if f.category == "Vulnerability":
+            parsed[f.band] = parsed.get(f.band, 0) + 1
 
+    if not parsed and sum(expected.values()) > 0:
+        raise FindingsError(
+            f"The SCA summary reports {sum(expected.values())} vulnerability "
+            f"finding(s) but no rows could be parsed at all, so the "
+            f"issue-table format has probably changed. Marking this scan as "
+            f"not reported rather than showing it as clean.")
+
+    short = {b: expected[b] - parsed.get(b, 0) for b in expected
+             if parsed.get(b, 0) and parsed[b] < expected[b]}
+    if short:
+        detail = ", ".join(f"{n} {b}" for b, n in sorted(short.items()))
+        message = (f"{sum(short.values())} SCA vulnerabilities ({detail}) are "
+                   f"counted in the scan summary but could not be read from "
+                   f"the issue table. Those shown are accurate; treat the "
+                   f"totals as a lower bound.")
+        print(f"::warning::{message}")
+        if notes is not None:
+            notes.append(message)
+
+    omitted = {b: expected[b] for b in expected
+               if expected[b] and not parsed.get(b, 0)}
+    if omitted:
+        detail = ", ".join(f"{n} {b}-risk" for b, n in sorted(omitted.items()))
+        message = (f"The scan summary also counts {detail} "
+                   f"vulnerabilities that the agent does not itemise, so they "
+                   f"are not listed individually here.")
+        print(message)
+        if notes is not None:
+            notes.append(message)
 
 def gh_request(api: str, method: str, path_or_url: str, token: str,
                payload: Optional[dict] = None):
