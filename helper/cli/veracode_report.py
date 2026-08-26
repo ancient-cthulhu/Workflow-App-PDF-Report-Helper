@@ -50,6 +50,32 @@ except ImportError as exc:
           f"to veracode_report.py ({exc}).")
     raise SystemExit(1)
 
+HELPER_VERSION = "2026.08.26"
+
+
+def _check_versions() -> None:
+    """Fail clearly when the three helper files are not from one release.
+
+    They are installed by copying them into another repository, so it is easy
+    to update one and leave another behind. Without this the mismatch surfaces
+    later as an AttributeError on whichever function moved, which says nothing
+    about the actual problem.
+    """
+    others = (("veracode_findings.py", vf), ("veracode_pdf.py", pdf))
+    stale = [(name, getattr(mod, "HELPER_VERSION", "an older, unversioned copy"))
+             for name, mod in others
+             if getattr(mod, "HELPER_VERSION", None) != HELPER_VERSION]
+    if stale:
+        found = ", ".join(f"{name} is {ver}" for name, ver in stale)
+        print(f"::error::Mismatched helper files. veracode_report.py is "
+              f"{HELPER_VERSION} but {found}. Copy all three files from "
+              f"helper/cli/ of the same release; updating one without the "
+              f"others leaves the helper broken.")
+        raise SystemExit(1)
+
+
+_check_versions()
+
 FRAGMENT_SCHEMA = 1
 MAX_FRAGMENT_BYTES = 64 * 1024 * 1024
 SCAN_IDS = ["pipeline", "sca", "iac"]
@@ -1558,6 +1584,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         description="Build a consolidated Veracode PDF report from SAST, SCA "
                     "and IaC/Secrets findings.")
+    ap.add_argument("--version", action="version",
+                    version=f"veracode_report.py {HELPER_VERSION}")
     sub = ap.add_subparsers(dest="command", required=True)
 
     ex = sub.add_parser("export", help="Normalize one scan's results into a "

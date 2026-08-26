@@ -24,6 +24,8 @@ from __future__ import annotations
 import re
 import unicodedata
 import zlib
+
+HELPER_VERSION = "2026.08.26"
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 __all__ = ["Canvas", "Doc", "PAGE_SIZES", "text_width", "hex_color"]

@@ -26,6 +26,8 @@ from __future__ import annotations
 import json
 import os
 import re
+
+HELPER_VERSION = "2026.08.26"
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 SIGNAL_RANK: Dict[str, int] = {
