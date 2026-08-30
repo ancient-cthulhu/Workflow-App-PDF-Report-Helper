@@ -485,9 +485,23 @@ class ReportContext:
         return counts
 
     @property
+    def reported(self) -> List[str]:
+        """Scans that have results in this report, in a stable order."""
+        return [s for s in SCAN_IDS if s in self.fragments]
+
+    @property
     def complete(self) -> bool:
-        """True only when every scan has reported for this commit."""
-        return not self.missing
+        """Whether all three scans are represented.
+
+        Used only to decide how confidently a clean result may be stated. The
+        report deliberately does not try to work out which scans were supposed
+        to run: that depends on push and pull_request triggers, branch include
+        and exclude lists, target branches, and analysis_on_platform, resolved
+        against both the repository's veracode.yml and the central one.
+        Reimplementing that decision would produce a confident and occasionally
+        wrong claim. Reporting what arrived cannot be wrong.
+        """
+        return len(self.fragments) == len(SCAN_IDS)
 
     @property
     def gated_total(self) -> int:
@@ -571,15 +585,16 @@ def _verdict_banner(doc: pdf.Doc, ctx: ReportContext) -> None:
                   f"exceed the configured severity threshold. They are listed "
                   f"in priority order below.")
     elif partial:
-        # Never present incomplete coverage as an all-clear.
+        # A clean result is stated only for the scans that reported, so it can
+        # never read as an all-clear for scans this report never saw.
         color, tint = SEV_COLOR["medium"], SEV_TINT["medium"]
-        headline = "INCOMPLETE COVERAGE"
-        reported = len(SCAN_IDS) - len(ctx.missing)
-        detail = (f"Only {reported} of {len(SCAN_IDS)} scans have reported for "
-                  f"this commit, and nothing they found meets the configured "
-                  f"threshold. This is not an all-clear: "
-                  f"{', '.join(SCAN_SHORT[s] for s in ctx.missing)} has not "
-                  f"reported.")
+        headline = "NOTHING AT OR ABOVE THRESHOLD"
+        names = ", ".join(SCAN_SHORT[s] for s in ctx.reported)
+        detail = (f"Covers {names}. {ctx.finding_total} finding(s) reported, "
+                  f"none of which meet the configured threshold. "
+                  f"{', '.join(SCAN_SHORT[s] for s in ctx.missing)} did not "
+                  f"report for this commit, so this is not a statement about "
+                  f"{'it' if len(ctx.missing) == 1 else 'them'}.")
     else:
         color, tint = PASS_GREEN, PASS_TINT
         headline = "NOTHING AT OR ABOVE THRESHOLD"
@@ -636,15 +651,8 @@ def _coverage_table(doc: pdf.Doc, ctx: ReportContext) -> None:
             pdf.Column("Low", 0.75, align="c"),
             pdf.Column("Info", 0.75, align="c")]
     rows = []
-    for scan in SCAN_IDS:
-        frag = ctx.fragments.get(scan)
-        if not frag:
-            rows.append([{"text": SCAN_LABEL[scan], "color": LINK,
-                          "dest": SCAN_DEST[scan]},
-                         {"text": "Not reported", "color": MUTED,
-                          "font": "i"},
-                         "-", "-", "-", "-", "-", "-", "-", "-"])
-            continue
+    for scan in ctx.reported:
+        frag = ctx.fragments[scan]
         gated = int(frag.get("gated") or 0)
         counts = frag.get("counts") or {}
         status = f"{gated} to review" if gated else "Clear"
@@ -1047,12 +1055,10 @@ def _appendix(doc: pdf.Doc, ctx: ReportContext) -> None:
     cols = [pdf.Column("Scan", 3.4), pdf.Column("Threshold", 1.6, align="c"),
             pdf.Column("Findings at or above it", 2.4, align="c")]
     rows = []
-    for scan in SCAN_IDS:
-        frag = ctx.fragments.get(scan) or {}
-        rows.append([
-            SCAN_LABEL[scan],
-            str(frag.get("threshold", "not reported")),
-            str(frag.get("gated", "-")) if frag else "-"])
+    for scan in ctx.reported:
+        frag = ctx.fragments[scan]
+        rows.append([SCAN_LABEL[scan], str(frag.get("threshold", "-")),
+                     str(frag.get("gated", "-"))])
     pdf.draw_table(doc, cols, rows, header_fill="#4A5C6D")
 
     doc.heading("About this report", size=11, top_gap=14, rule=False,
@@ -1104,11 +1110,12 @@ def _cover(doc: pdf.Doc, ctx: ReportContext) -> None:
     _coverage_table(doc, ctx)
 
     if ctx.missing:
-        names = ", ".join(SCAN_SHORT[s] for s in ctx.missing)
+        absent = ", ".join(SCAN_SHORT[s] for s in ctx.missing)
         doc.paragraph(
-            f"Not every scan has reported for this commit ({names} missing). "
-            f"The report is rebuilt by each scan as it completes, so the "
-            f"linked document is replaced when the remaining scans finish.",
+            f"This report covers the scan(s) above. {absent} did not report "
+            f"for this commit, either because it is not enabled for this "
+            f"repository or event, or because it has not finished. The report "
+            f"is rebuilt as each scan reports.",
             font="i", size=8.3, color=MUTED, bottom_gap=10)
 
     _top_risks(doc, ctx)
@@ -1127,7 +1134,7 @@ def render_pdf(ctx: ReportContext, out_path: str, page_size: str = "a4",
                   on_page=_page_furniture(ctx))
     doc.y = 0
     _cover(doc, ctx)
-    for scan in SCAN_IDS:
+    for scan in ctx.reported:
         doc.page_break()
         _scan_section(doc, ctx, scan, max_cards)
     doc.page_break()
@@ -1306,9 +1313,8 @@ def build_comment(ctx: ReportContext, pdf_url: str, pdf_name: str,
     if failed:
         badge = f"{ctx.gated_total} finding(s) at or above threshold"
     elif not ctx.complete:
-        badge = (f"Incomplete coverage: "
-                 f"{len(SCAN_IDS) - len(ctx.missing)} of {len(SCAN_IDS)} scans "
-                 f"reported, nothing above threshold so far")
+        badge = (f"Nothing at or above threshold in "
+                 f"{', '.join(SCAN_SHORT[s] for s in ctx.reported)}")
     else:
         badge = "No findings at or above threshold"
     counts = ctx.totals()
@@ -1319,7 +1325,8 @@ def build_comment(ctx: ReportContext, pdf_url: str, pdf_name: str,
         "## Veracode Security Report",
         "",
         f"> **{badge}**  ",
-        f"> {ctx.finding_total} finding(s) across SAST, SCA and IaC/Secrets "
+        f"> {ctx.finding_total} finding(s) across "
+        f"{', '.join(SCAN_SHORT[s] for s in ctx.reported)} "
         f"\u00b7 **{ctx.gated_total}** at or above threshold",
         "",
         "| " + " | ".join(f"{dot[b]} {b.capitalize()}" for b in BANDS)
@@ -1331,11 +1338,8 @@ def build_comment(ctx: ReportContext, pdf_url: str, pdf_name: str,
         "| Scan | Status | Threshold | Findings | At or above |",
         "|:--|:--|:--:|--:|--:|",
     ]
-    for scan in SCAN_IDS:
-        frag = ctx.fragments.get(scan)
-        if not frag:
-            lines.append(f"| {SCAN_LABEL[scan]} | _pending_ | - | - | - |")
-            continue
+    for scan in ctx.reported:
+        frag = ctx.fragments[scan]
         gated = int(frag.get("gated") or 0)
         result = f"\u26a0\ufe0f {gated} to review" if gated else "\u2705 Clear"
         lines.append(f"| {SCAN_LABEL[scan]} | {result} | "
@@ -1397,10 +1401,12 @@ def build_comment(ctx: ReportContext, pdf_url: str, pdf_name: str,
             lines.append("")
 
     if ctx.missing:
-        names = ", ".join(SCAN_SHORT[s] for s in ctx.missing)
-        lines.append(f"> \u2139\ufe0f {names} has not reported for this commit "
-                     f"yet. This comment and the PDF are rebuilt as each scan "
-                     f"finishes.")
+        absent = ", ".join(SCAN_SHORT[s] for s in ctx.missing)
+        lines.append(f"> \u2139\ufe0f Covers "
+                     f"{', '.join(SCAN_SHORT[s] for s in ctx.reported)}. "
+                     f"{absent} did not report for this commit, either because "
+                     f"it is not enabled here or because it has not finished. "
+                     f"This comment is rebuilt as each scan reports.")
         lines.append("")
     lines.append("<sub>Generated by the Veracode GitHub workflow "
                  "integration.</sub>")
@@ -1506,6 +1512,20 @@ def comment_only(args: argparse.Namespace) -> int:
     write_job_summary(markdown)
     post_comment(markdown)
     return 0
+
+
+_CONFIG_CACHE: Dict[str, str] = {}
+
+
+def scanned_repo_config() -> str:
+    """The scanned repository's veracode.yml, fetched once."""
+    key = "remote"
+    if key not in _CONFIG_CACHE:
+        _CONFIG_CACHE[key] = vf.fetch_repo_file(
+            env("SCAN_REPO"), env("CONFIG_FILE", "veracode.yml"),
+            env("BLOB_REF") or env("HEAD_SHA"),
+            env("GH_TOKEN") or env("GITHUB_TOKEN"))
+    return _CONFIG_CACHE[key]
 
 
 def scan_enabled(scan: str, local_config: str) -> Tuple[bool, str]:
