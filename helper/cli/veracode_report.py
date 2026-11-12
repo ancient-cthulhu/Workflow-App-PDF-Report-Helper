@@ -1414,6 +1414,37 @@ def build_comment(ctx: ReportContext, pdf_url: str, pdf_name: str,
     return "\n".join(lines)
 
 
+def job_summary(ctx: ReportContext, markdown: str) -> str:
+    """Wrap the report for the job summary so repeated entries read as a
+    timeline instead of copies.
+
+    Each scan calls this workflow as its own job, and GitHub cannot edit
+    another job's summary, so the run page always shows one entry per scan,
+    ordered by completion time. Each entry says which scan triggered it and
+    what it covers. Partial entries keep the report collapsed; only the entry
+    that has every scan shows it open.
+    """
+    scan = env("REPORT_SCAN")
+    covered = ", ".join(SCAN_SHORT[s] for s in ctx.reported)
+    title = (f"{SCAN_SHORT[scan]} finished" if scan in SCAN_SHORT
+             else "report updated")
+    lines = [f"### Veracode report: {title} "
+             f"({len(ctx.reported)} of {len(SCAN_IDS)} scans)", "",
+             f"Covers {covered}."]
+    if ctx.complete:
+        lines += ["", "All scans have reported. This is the final report "
+                  "for this commit.", "", markdown]
+        return "\n".join(lines)
+    absent = ", ".join(SCAN_SHORT[s] for s in ctx.missing)
+    lines[-1] += (f" No result yet from {absent} (not enabled, or still "
+                  f"running). A later entry below supersedes this one if it "
+                  f"reports; the PR comment always shows the latest.")
+    lines += ["", "<details>",
+              f"<summary>Report as of {title}</summary>", "",
+              markdown, "", "</details>"]
+    return "\n".join(lines)
+
+
 def write_job_summary(markdown: str) -> None:
     path = os.environ.get("GITHUB_STEP_SUMMARY")
     if not path:
@@ -1477,9 +1508,11 @@ def build_report(args: argparse.Namespace) -> int:
             env("ARTIFACT_TOKEN") or env("GITHUB_TOKEN"), api)
 
     markdown = build_comment(ctx, pdf_url, pdf_name, branch_hosted)
-    write_job_summary(markdown)
 
+    # The workflow writes the summary from the 'comment' step, after the
+    # artifact exists. Writing here too printed the report twice per job.
     if args.pr_comment:
+        write_job_summary(job_summary(ctx, markdown))
         post_comment(markdown)
     return 0
 
@@ -1509,7 +1542,7 @@ def comment_only(args: argparse.Namespace) -> int:
         env("GITHUB_API_URL", "https://api.github.com"))
     markdown = build_comment(ctx, pdf_url, args.artifact_name,
                              bool(args.pdf_url))
-    write_job_summary(markdown)
+    write_job_summary(job_summary(ctx, markdown))
     post_comment(markdown)
     return 0
 
