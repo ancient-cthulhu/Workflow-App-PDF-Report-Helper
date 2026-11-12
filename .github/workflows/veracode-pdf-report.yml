@@ -404,6 +404,8 @@ jobs:
           ARTIFACT_TOKEN: ${{ github.token }}
           GH_TOKEN: ${{ inputs.token || secrets.comment_token || github.token }}
           SHORT_SHA: ${{ steps.locate.outputs.short_sha }}
+          # Names the scan that triggered this job in the job summary.
+          REPORT_SCAN: ${{ inputs.scan }}
         run: |
           set -euo pipefail
           python3 helper/cli/veracode_report.py comment \
